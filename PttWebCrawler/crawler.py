@@ -10,6 +10,7 @@ import requests
 import argparse
 import time
 import codecs
+import threading
 from bs4 import BeautifulSoup
 from six import u
 
@@ -57,10 +58,11 @@ class PttWebCrawler(object):
                 self.parse_article(article_id, board)
 
     def parse_articles(self, start, end, board, path='.', timeout=3):
-            filename = board + '-' + str(start) + '-' + str(end) + '.json'
+            filename = board + '-' + str(start) + '-' + str(end-1) + '.json'
             filename = os.path.join(path, filename)
-            self.store(filename, u'{"articles": [', 'w')
-            for i in range(end-start+1):
+            articles = []
+            id_articles = {}
+            for i in range(end-start):
                 index = start + i
                 print('Processing index:', str(index))
                 resp = requests.get(
@@ -72,36 +74,38 @@ class PttWebCrawler(object):
                     continue
                 soup = BeautifulSoup(resp.text, 'html.parser')
                 divs = soup.find_all("div", "r-ent")
+                content = ''
                 for div in divs:
                     try:
                         # ex. link would be <a href="/bbs/PublicServan/M.1127742013.A.240.html">Re: [問題] 職等</a>
                         href = div.find('a')['href']
                         link = self.PTT_URL + href
                         article_id = re.sub('\.html', '', href.split('/')[-1])
-                        if div == divs[-1] and i == end-start:  # last div of last page
-                            self.store(filename, self.parse(link, article_id, board), 'a')
-                        else:
-                            self.store(filename, self.parse(link, article_id, board) + ',\n', 'a')
+                        articles.append(article_id)
+                        threading.Thread(target=self.parse, args=[link, article_id, board, id_articles]).start()
                     except:
                         pass
-                time.sleep(0.1)
-            self.store(filename, u']}', 'a')
+                # Wait until all threads are done.
+                while len(articles) != len(id_articles):
+                    continue
+            json_data = {'articles': [id_articles[i] for i in articles]}
+            self.store(filename, json.dumps(json_data, sort_keys=True, ensure_ascii=False, indent=True), 'w')
             return filename
 
     def parse_article(self, article_id, board, path='.'):
         link = self.PTT_URL + '/bbs/' + board + '/' + article_id + '.html'
         filename = board + '-' + article_id + '.json'
         filename = os.path.join(path, filename)
-        self.store(filename, self.parse(link, article_id, board), 'w')
+        self.store(filename, self.parse(link, article_id, board, {}), 'w')
         return filename
 
     @staticmethod
-    def parse(link, article_id, board, timeout=3):
+    def parse(link, article_id, board, storage, timeout=3):
         print('Processing article:', article_id)
         resp = requests.get(url=link, cookies={'over18': '1'}, verify=VERIFY, timeout=timeout)
         if resp.status_code != 200:
             print('invalid url:', resp.url)
-            return json.dumps({"error": "invalid url"}, sort_keys=True, ensure_ascii=False)
+            storage[article_id] = json.dumps({"error": "invalid url"}, sort_keys=True, ensure_ascii=False)
         soup = BeautifulSoup(resp.text, 'html.parser')
         main_content = soup.find(id="main-content")
         metas = main_content.select('div.article-metaline')
@@ -109,9 +113,12 @@ class PttWebCrawler(object):
         title = ''
         date = ''
         if metas:
-            author = metas[0].select('span.article-meta-value')[0].string if metas[0].select('span.article-meta-value')[0] else author
-            title = metas[1].select('span.article-meta-value')[0].string if metas[1].select('span.article-meta-value')[0] else title
-            date = metas[2].select('span.article-meta-value')[0].string if metas[2].select('span.article-meta-value')[0] else date
+            try:
+                author = metas[0].select('span.article-meta-value')[0].string if metas[0].select('span.article-meta-value')[0] else author
+                title = metas[1].select('span.article-meta-value')[0].string if metas[1].select('span.article-meta-value')[0] else title
+                date = metas[2].select('span.article-meta-value')[0].string if metas[2].select('span.article-meta-value')[0] else date
+            except:
+                data = {}
 
             # remove meta nodes
             for meta in metas:
@@ -149,19 +156,22 @@ class PttWebCrawler(object):
         for push in pushes:
             if not push.find('span', 'push-tag'):
                 continue
-            push_tag = push.find('span', 'push-tag').string.strip(' \t\n\r')
-            push_userid = push.find('span', 'push-userid').string.strip(' \t\n\r')
-            # if find is None: find().strings -> list -> ' '.join; else the current way
-            push_content = push.find('span', 'push-content').strings
-            push_content = ' '.join(push_content)[1:].strip(' \t\n\r')  # remove ':'
-            push_ipdatetime = push.find('span', 'push-ipdatetime').string.strip(' \t\n\r')
-            messages.append( {'push_tag': push_tag, 'push_userid': push_userid, 'push_content': push_content, 'push_ipdatetime': push_ipdatetime} )
-            if push_tag == u'推':
-                p += 1
-            elif push_tag == u'噓':
-                b += 1
-            else:
-                n += 1
+            try:
+                push_tag = push.find('span', 'push-tag').string.strip(' \t\n\r')
+                push_userid = push.find('span', 'push-userid').string.strip(' \t\n\r')
+                # if find is None: find().strings -> list -> ' '.join; else the current way
+                push_content = push.find('span', 'push-content').strings
+                push_content = ' '.join(push_content)[1:].strip(' \t\n\r')  # remove ':'
+                push_ipdatetime = push.find('span', 'push-ipdatetime').string.strip(' \t\n\r')
+                messages.append( {'push_tag': push_tag, 'push_userid': push_userid, 'push_content': push_content, 'push_ipdatetime': push_ipdatetime} )
+                if push_tag == u'推':
+                    p += 1
+                elif push_tag == u'噓':
+                    b += 1
+                else:
+                    n += 1
+            except:
+                continue
 
         # count: 推噓文相抵後的數量; all: 推文總數
         message_count = {'all': p+b+n, 'count': p-b, 'push': p, 'boo': b, "neutral": n}
@@ -182,8 +192,8 @@ class PttWebCrawler(object):
             'message_count': message_count,
             'messages': messages
         }
-        # print 'original:', d
-        return json.dumps(data, sort_keys=True, ensure_ascii=False)
+
+        storage[article_id] = data
 
     @staticmethod
     def getLastPage(board, timeout=3):
